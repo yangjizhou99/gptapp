@@ -1,0 +1,304 @@
+好的！这是为 **Photo Recipe** 项目写的“给 AI 看的说明书”。目标是：让任何代码助手**少思考、直接照做**；减少无用探索，从而省花费。你可以把这份文件放到仓库根目录当作 `README_DEV.md`。
+
+---
+
+# Photo Recipe · 开发说明（AI 友好版）
+
+## 核心目标
+
+把人像拍摄方案做成**可视化、可复刻、可分享**的 3D 场景与参数“配方（Recipe）”。
+用户能：看摆位 → 看相机视角 → 一键复刻/分享/导入导出。
+
+---
+
+## 一、快速运行
+
+* 环境：Node.js LTS ≥ 20、npm
+* 安装与启动：
+
+  ```bash
+  npm i
+  npm run dev
+  # 打开终端显示的本地地址（通常 http://localhost:5173）
+  ```
+
+---
+
+## 二、项目结构（关键文件）
+
+```
+src/
+  App.tsx                  # 左侧 UI 面板、状态管理、导入导出、开关项
+  ThreeStage.tsx           # Three.js 场景：相机/模特/光源/箭头/预览/拾取
+  types.ts                 # 统一类型/Schema（Recipe、CameraRig、Subject…）
+  utils_photomath.ts       # 摄影数学：FoV/虚化/软硬度等简化计算
+  utils_auto.ts            # 机位反推：vFovRad、distanceForFraming、cameraPoseFromParams
+  utils_style.ts           # 风格与镜头兼容性筛选（区间相交）
+  templates.ts             # 10 个风格模板（含 styleMeta + aim）
+  wizard.tsx               # 三步向导（最终版：镜头→风格→确认/应用）
+  schema.ts                # （可选）导入校验
+  i18n.ts                  # （可选）多语言
+```
+
+---
+
+## 三、坐标/单位/分层（必须遵守）
+
+* 坐标系：右手；**XZ 地面、Y 向上**
+* 单位：Three 场景用 **米**；`subject.height/width` 用 **厘米**；`sensor/focal` 用 **mm**
+* 层（Layer）：
+
+  * **0 层**：主体对象（模特、相机成像、可见几何）
+  * **1 层（HELPER\_LAYER）**：辅助对象（Grid、Axes、TransformControls 可视、各类箭头、对准点小球）
+  * 预览相机 **shootCam 仅渲染 0 层**；编辑相机 **editorCam 渲染 0+1 层**
+* TransformControls 动态层：
+
+  * **控制模式开**：将 TransformControls 切到 **0 层**（即使隐藏 helpers 也能拖）
+  * **控制模式关**：将 TransformControls 切回 **1 层**并 `detach()`
+
+---
+
+## 四、数据模型（类型/Schema）
+
+### 1) 主要类型（`types.ts`）
+
+```ts
+export type Vec3 = [number, number, number]
+
+export type SubjectVisual = 'rect'|'figure'
+export interface SubjectSpec {
+  height: number      // cm
+  width: number       // cm
+  position: Vec3      // (x,0,z)，y 由高度推算
+  visual?: SubjectVisual           // 默认为 'figure'
+  figureStyle?: { headRatio?: number; upperRatio?: number; lowerRatio?: number; colors?: {head?:number; upper?:number; lower?:number} }
+}
+
+export interface CameraSpec {
+  sensor: { w: number; h: number } // mm
+  focal: number                    // mm
+  aperture: number                 // f 值
+  iso: number
+  shutter: string                  // '1/250' 等
+}
+
+export type AimMode = 'subjectEye'|'subjectCenter'|'custom'
+export interface CameraRig {
+  position: Vec3      // m
+  lookAt: Vec3        // m（与 aim 双存，便于兼容）
+  spec: CameraSpec
+  aim?: { mode: AimMode; customPoint?: Vec3; eyeRatio?: number } // eyeRatio 默认 0.93
+}
+
+export type Framing = 'full'|'half'|'close'
+export interface LensSpec {
+  name?: string
+  isZoom: boolean
+  focalMin: number    // mm
+  focalMax: number    // mm
+  minAperture?: number
+}
+
+export interface StyleMeta {
+  framing: Framing
+  defaultAim: AimMode
+  focalRange?: { min: number; max: number }  // 用 mm，与当前镜头一致
+  notes?: string
+}
+
+export interface Recipe {
+  subject: SubjectSpec
+  cameraRig: CameraRig
+  light: { position: Vec3 }                 // v1 单光源
+  lens?: LensSpec                           // UI 展示/筛选用
+  styleMeta?: StyleMeta                     // 模板/风格元信息
+  // 可选：env、tags等
+}
+```
+
+### 2) Recipe JSON（导入/导出）
+
+* **双存策略**：始终同时写出 `cameraRig.aim` 与 `cameraRig.lookAt`。
+* **导入兼容**：若 `aim` 缺失 → 注入 `{mode:'custom', customPoint: lookAt}` 保持外观不变。
+
+---
+
+## 五、功能要点（最终状态）
+
+### 1) 模特可视化
+
+* `subject.visual='figure'`：三段低模女性人像（头/上身/下身），区分明显；默认
+* `subject.visual='rect'`：旧矩形模式（对比/回退）
+
+### 2) 三步向导（最终逻辑：**镜头 → 风格 → 确认/应用**）
+
+* **Step1 镜头**：选择画幅（传感器）+ 镜头 `LensSpec`；展示焦距/光圈范围；将当前 `focal` 夹紧到 `[focalMin,focalMax]`
+* **Step2 风格**：从 `templates.ts` 的 `TEMPLATES` 中按 **镜头兼容性** 筛选（`styleMeta.focalRange` 与镜头区间相交）
+* **Step3 应用**：应用风格仅合并 **灯位/标签/可选 env**；**不覆盖**机身镜头。
+  按 `styleMeta.framing`（full=0.90，half=0.60，close=0.40）＋当前相机参数 →
+  `vFovRad(sensor.h,focal)` → `distanceForFraming()` → `cameraPoseFromParams()` → 写回 `cameraRig.position/lookAt`；
+  设置 `cameraRig.aim.mode = styleMeta.defaultAim`。
+
+### 3) 相机对准
+
+* `AimMode` 三种：`subjectEye`、`subjectCenter`、`custom`
+* **有效对准点**计算优先级：`customPoint`（custom）> `subjectEye`（eyeRatio×身高）> `subjectCenter`（身高中点）> `lookAt` 回退
+* **指向箭头**（蓝色）：**相机 → 有效对准点**，在 HELPER\_LAYER，仅主视图可见
+
+### 4) 对准点交互
+
+* 控制目标新增 **“对准点（aimTarget）”**：一个小球（HELPER\_LAYER）
+* 控制模式启用＋目标=aimTarget → 可拖拽，`customPoint` 实时更新
+* **点击设点（Raycaster）**：命中**人物**或**地面**即可设置对准点
+
+  * **门禁**（避免误触）：
+
+    * `aimClickMode`: `'off'|'holdShift'|'always'`（默认 `'holdShift'`）
+    * 控制模式且当前目标≠aim → **不触发**
+    * TransformControls 正在拖拽或 hover 轴 → **不触发**
+    * `autoSwitchAimOnClick=false`：点击设点**不**强制切目标（默认）
+
+### 5) 预览窗口
+
+* `shootCam` 只渲染 0 层 → 永远**不显示**网格、坐标、箭头、手柄、小球
+* 焦距/画幅变化 → 预览自动更新 FoV
+
+### 6) 其他
+
+* “确定参数”按钮：手动修改参数后，按最近 framing/yaw/pitch 自动反算机位并应用
+* 模板库：10 个模板，**每个都有 `styleMeta` 与合理的 `aim`**
+* 复刻码：`lz-string` 压缩到 `location.hash`
+* EXIF 导入：`exifr.parse` 读取焦距/光圈/ISO/快门填充 `cameraRig.spec`（可选）
+
+---
+
+## 六、摄影数学（`utils_*`）
+
+### 1) 视场角 / 距离（核心）
+
+```ts
+// utils_auto.ts
+export function vFovRad(sensorHmm:number, focalMm:number) {
+  return 2 * Math.atan(sensorHmm / (2 * focalMm))
+}
+
+export function distanceForFraming(subjectHeightM:number, vFov:number, targetFill:number) {
+  // 画面高度 = 2 * d * tan(vFov/2)
+  // subjectHeightM = targetFill * 画面高度 → 解 d
+  return subjectHeightM / (targetFill * 2 * Math.tan(vFov/2))
+}
+
+export function cameraPoseFromParams(
+  subjectCenter: Vec3, subjectEyeY:number, distanceM:number, yawDeg:number, pitchDeg:number
+): { position: Vec3; lookAt: Vec3 } // 已实现
+```
+
+### 2) 预估指标（简化）
+
+* `bokehIndex(spec, focusDist, bgDist, crop)` → 0–5 星（展示用）
+* `lightSoftness(sizeCm, distanceM)` → 0\~1（红/黄/绿条）
+
+---
+
+## 七、控制/可见性约定（避免踩坑）
+
+1. **TransformControls 与 Helper 层**
+
+   * 关闭“显示控制箭头”时，TransformControls 会被隐藏；**控制模式开启**时自动把手柄切到 0 层，保证可拖拽
+2. **点击设点的门禁**（已修复误触问题）
+
+   * 仅当 `aimClickMode` 条件满足且不在拖拽/hover 轴时生效
+   * 不自动切控制目标（除非 `autoSwitchAimOnClick=true`）
+3. **应用风格**
+
+   * **只**合并灯位/标签/env；严禁覆盖 `cameraRig.spec` 与 `position/lookAt/aim`
+4. **导入导出**
+
+   * 始终双存 `aim + lookAt`；导入旧数据自动转为 `aim.custom`（不变更视觉）
+5. **单位换算**
+
+   * Three 场景一律米，身高/宽度从 cm 转 m；sensor/focal 用 mm
+
+---
+
+## 八、最终 UI 行为清单（AI 执行用）
+
+* 侧栏开关与状态：
+
+  * `showHelpers: boolean`：切换 Grid/Axes/箭头/小球显示（预览不受影响）
+  * `controlMode: boolean`：控制模式开/关（决定 TransformControls 层）
+  * `controlTarget: 'camera'|'subject'|'light'|'aim'`
+  * `aimClickMode: 'off'|'holdShift'|'always'`（默认 `'holdShift'`）
+  * `autoSwitchAimOnClick: boolean`（默认 `false`）
+* 三步向导：
+
+  1. **镜头**：设置 `recipe.lens` 和 `recipe.cameraRig.spec.sensor`；夹紧 `spec.focal`
+  2. **风格筛选**：`styleCompatible(template, lens)` → 只显示兼容项（或灰显不兼容项）
+  3. **应用**：依据 `styleMeta.framing`+当前焦距 → 反算距离 → `cameraPoseFromParams` → 写回位置/朝向；`aim.mode = styleMeta.defaultAim`
+* “确定参数”：用当前 `sensor/focal` + 最近 `framing/yaw/pitch` 同样计算并应用
+* 对准点：
+
+  * `aim=custom` 时默认选中“对准点”为控制目标（可按当前策略保留/关闭自动切）
+  * 单击（满足门禁）或拖拽 → 更新 `customPoint`，预览与箭头同步
+
+---
+
+## 九、模板（`templates.ts`）规范
+
+* 必须包含：`title`、`subject`、`cameraRig`（含 `aim`）、`light`、`styleMeta`（**framing + defaultAim + focalRange**）
+* **示例（简）**
+
+```ts
+{
+  title: '经典85等效半身（APS-C 50/2）',
+  styleMeta: { framing:'half', defaultAim:'subjectEye', focalRange:{min:45, max:60} },
+  subject: { height:170, width:45, position:[0,0,0], visual:'figure' },
+  cameraRig: {
+    position:[0,1.58,-2.0],
+    lookAt:[0,1.58,0],
+    spec:{ sensor:{w:22.3,h:14.9}, focal:50, aperture:2.0, iso:200, shutter:'1/250' },
+    aim:{ mode:'subjectEye', eyeRatio:0.93 }
+  },
+  light: { position:[-1.2,1.9,-0.6] },
+  lens: { isZoom:false, focalMin:50, focalMax:50, minAperture:2.0 }
+}
+```
+
+---
+
+## 十、代码风格与约束（省心省钱版）
+
+* **不新增依赖**（除非明确提出）
+* 类型安全：保持 `types.ts` 为唯一权威；新增字段先改类型再改实现
+* 避免重写已有函数：优先**复用** `utils_auto.ts` 与 `utils_photomath.ts`
+* 渲染性能：减少频繁创建/销毁 Three 对象；数据变化用 `set`/`copy` 更新
+* 事件解绑：在 `useEffect` 清理 `addEventListener`
+* 兼容性：任何改动都不得破坏旧 JSON/复刻码（hash）导入
+
+---
+
+## 十一、常见问题（给 AI 的速查）
+
+* **Q：应用风格为什么不改相机焦距？**
+  A：最终版逻辑是 **先选镜头** → 再选风格；风格仅决定构图与默认对准，不覆盖机身镜头。
+* **Q：预览里为什么看不到箭头/网格？**
+  A：设计如此。预览相机只渲染 0 层，保证干净。
+* **Q：点击就切到 Aim 导致无法拖相机/模特？**
+  A：已修复。需满足 `aimClickMode` 门禁才会设点；控制模式且目标≠aim 时不会触发。
+* **Q：TransformControls 为什么有时看不见？**
+  A：关掉“显示控制箭头”会隐藏 helper 层。控制模式开时会自动把手柄切到 0 层以保证拖拽。
+
+---
+
+## 十二、回归测试脚本（每次提交前跑一遍）
+
+1. 启动 → 载入任意模板 → 预览只见主体，无任何辅助 UI
+2. Step1 选变焦 18–55 → 焦距自动夹紧；Step2 只显示兼容风格（“显示全部”可看灰项）
+3. 应用一个全身风格 → 机位按 0.90 填充，`aim=subjectCenter`，预览占比正确
+4. 改 `aim=custom`：
+
+   * **Shift+单击**人像/地面 → 对准点移动；箭头和预览中心同步
+   * 控制模式=开，目标=相机/模特 → 单击不会设点
+5. 关闭“显示控制箭头” → 主视图隐藏箭头/小球/网格；控制模式仍可拖
+6. 导出 JSON → 新开窗口导入 → 视觉一致
+
