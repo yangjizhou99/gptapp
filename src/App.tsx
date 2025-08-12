@@ -47,6 +47,11 @@ export default function App() {
   const [aimClickMode, setAimClickMode] = useState<'off'|'holdShift'|'always'>('holdShift')
   const [autoSwitchAimOnClick, setAutoSwitchAimOnClick] = useState(false)
 
+  // 地面距离标识控制
+  const [showRuler, setShowRuler] = useState(true)
+  const [rulerStep, setRulerStep] = useState(0.5) // m
+  const [rulerMax, setRulerMax] = useState(10)    // m
+
   // 从URL hash加载recipe
   useEffect(() => {
     const hashRecipe = decodeRecipeFromHash()
@@ -530,6 +535,10 @@ export default function App() {
         controlMode={controlMode}
         aimClickMode={aimClickMode}
         autoSwitchAimOnClick={autoSwitchAimOnClick}
+        // 新增距离标识参数
+        showRuler={showRuler}
+        rulerStep={rulerStep}
+        rulerMax={rulerMax}
       />
 
       {showWizard && (

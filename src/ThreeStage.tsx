@@ -17,6 +17,10 @@ interface Props {
   controlMode?: boolean
   aimClickMode?: 'off' | 'holdShift' | 'always'
   autoSwitchAimOnClick?: boolean
+  // 地面距离标识控制
+  showRuler: boolean
+  rulerStep: number
+  rulerMax: number
 }
 
 const HELPER_LAYER = 1
@@ -29,7 +33,10 @@ export default function ThreeStage({
   showHelpers = true, 
   controlMode = false,
   aimClickMode = 'holdShift',
-  autoSwitchAimOnClick = false
+  autoSwitchAimOnClick = false,
+  showRuler,
+  rulerStep,
+  rulerMax
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const previewRef = useRef<HTMLCanvasElement | null>(null)
@@ -50,6 +57,12 @@ export default function ThreeStage({
     // Editor camera (for orbiting the scene)
     const editorCam = new THREE.PerspectiveCamera(60, 1, 0.1, 100)
     editorCam.position.set(6, 4, 8)
+    
+    // Capture current values of ruler props
+    const currentRulerStep = rulerStep;
+    const currentRulerMax = rulerMax;
+    const currentShowRuler = showRuler;
+    const currentShowHelpers = showHelpers;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true })
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
@@ -140,11 +153,116 @@ export default function ThreeStage({
     }
     updateAimArrow()
 
-    // Ambient + a small directional light so we see things
-    scene.add(new THREE.AmbientLight(0xffffff, 0.6))
-    const dir = new THREE.DirectionalLight(0xffffff, 0.6)
-    dir.position.set(3,5,2)
-    scene.add(dir)
+  // Ambient + a small directional light so we see things
+  scene.add(new THREE.AmbientLight(0xffffff, 0.6))
+  const dir = new THREE.DirectionalLight(0xffffff, 0.6)
+  dir.position.set(3,5,2)
+  scene.add(dir)
+
+  // 创建 rulerGroup 用于距离标识
+  const rulerGroup = new THREE.Group()
+  rulerGroup.name = 'rulerGroup'
+  rulerGroup.layers.set(HELPER_LAYER)
+  scene.add(rulerGroup)
+
+  // 初始构建距离标识
+  rebuildRuler(currentRulerStep, currentRulerMax)
+
+  // 应用距离标识可见性
+  function applyRulerVisibility() {
+    rulerGroup.visible = currentShowHelpers && currentShowRuler
+  }
+  applyRulerVisibility()
+
+  // 工具函数：画圆环与标签
+  function makeCircleLine(radius:number, segments=128, color=0xcccccc) {
+    const geo = new THREE.BufferGeometry()
+    const positions = new Float32Array((segments+1)*3)
+    for (let i=0; i<=segments; i++) {
+      const a = (i/segments) * Math.PI * 2
+      const x = Math.cos(a) * radius
+      const z = Math.sin(a) * radius
+      positions[i*3+0] = x
+      positions[i*3+1] = 0.001 // 抬高一点点，避免与网格闪烁
+      positions[i*3+2] = z
+    }
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    const mat = new THREE.LineBasicMaterial({ color, transparent:true, opacity:0.9 })
+    const line = new THREE.Line(geo, mat)
+    line.layers.set(HELPER_LAYER)
+    return line
+  }
+
+  function makeTextSprite(text:string) {
+    // 画到 canvas
+    const pad = 12
+    const fontSize = 48
+    const canvas = document.createElement('canvas')
+    canvas.width = 256; canvas.height = 128
+    const ctx = canvas.getContext('2d')!
+    ctx.clearRect(0,0,canvas.width,canvas.height)
+    ctx.font = `bold ${fontSize}px system-ui, -apple-system, Segoe UI, Roboto`
+    ctx.fillStyle = 'white'
+    ctx.textBaseline = 'middle'
+    const textW = ctx.measureText(text).width
+    // 背景条
+    const bgW = textW + pad*2, bgH = fontSize + pad
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'
+    const x0 = (canvas.width-bgW)/2, y0 = (canvas.height-bgH)/2
+    ctx.fillRect(x0, y0, bgW, bgH)
+    // 文字
+    ctx.fillStyle = 'white'
+    ctx.fillText(text, canvas.width/2 - textW/2, canvas.height/2)
+
+    const tex = new THREE.CanvasTexture(canvas)
+    tex.minFilter = THREE.LinearFilter
+    tex.magFilter = THREE.LinearFilter
+    tex.needsUpdate = true
+
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false })
+    const spr = new THREE.Sprite(mat)
+    spr.layers.set(HELPER_LAYER)
+    // 让它在世界里大概 0.5m 宽、0.2m 高（可按需改）
+    spr.scale.set(0.5, 0.2, 1)
+    spr.renderOrder = 999
+    return spr
+  }
+
+  // 重建函数
+  function rebuildRuler(step:number, max:number) {
+    // 清空
+    while (rulerGroup.children.length) {
+      const o = rulerGroup.children.pop()!
+      o.traverse(n=>{
+        // 释放贴图
+        // @ts-ignore
+        if ((n as any).material?.map) (n as any).material.map.dispose?.()
+        // @ts-ignore
+        n.material?.dispose?.()
+        // @ts-ignore
+        n.geometry?.dispose?.()
+      })
+      rulerGroup.remove(o)
+    }
+
+    // 环（0.5, 1, 1.5, ... <= max）
+    const segments = 128
+    for (let r = step; r <= max+1e-6; r += step) {
+      // 整米更亮一点
+      const isInt = Math.abs(r - Math.round(r)) < 1e-6
+      const color = isInt ? 0x999999 : 0xcccccc
+      const line = makeCircleLine(r, segments, color)
+      rulerGroup.add(line)
+
+      // 标签：只给整米加（0.5/0.25 很密会花）
+      if (isInt || step >= 1) {
+        const label = makeTextSprite(`${Number(r.toFixed(r<1?1:0))}m`)
+        // 放在 +X 方向稍微抬起
+        label.position.set(r, 0.06, 0)
+        rulerGroup.add(label)
+      }
+    }
+  }
 
     // 设置相机层
     // shootCam 只看 0 层（主体等实体对象）
